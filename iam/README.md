@@ -1,72 +1,92 @@
-# IAM MFA Enforcement Setup
+# MFA Enforcement in AWS Environment
 
-## 📋 Overview
-This IAM setup enforces **Multi-Factor Authentication (MFA)** for all users before they can access any AWS resources. The system uses group-based permissions and conditional policies to ensure security compliance.
+## Overview
+This solution automatically enforces Multi-Factor Authentication (MFA) for all IAM users in the AWS environment. The `EnforceMFA` policy attached to the `MFA` group denies access to ALL AWS resources unless the user has authenticated with MFA. Users are automatically added to this group upon creation via an EventBridge and Lambda automation.
 
-## 🎯 Key Features
-- **MFA Enforcement**: No resource access without MFA setup
-- **Group-Based Access Control**: Users inherit permissions through group membership
-- **Automated User Onboarding**: New users automatically join the "All-Staff" group
-- **Conditional Policies**: IAM policies require MFA for all API calls
+## 🔒 Critical Security Note
+**The `EnforceMFA` policy completely blocks access to ALL AWS resources for users without MFA authentication.** Users in the MFA group will be unable to access ANY resources (EC2, S3, RDS, etc.) assigned to them until they configure and authenticate with MFA.
 
-## 🏗️ Architecture Diagram
+## Architecture Diagram
 
 ```mermaid
-graph TB
-    subgraph "IAM Structure"
-        A[New User Created] --> B[Auto-added to All-Staff Group]
-        B --> C{MFA Status}
-        C -->|Not Configured| D[Deny All Resources<br/>Except MFA Setup]
-        C -->|Configured| E[Inherit Group Permissions]
-        E --> F[Access Granted to<br/>Assigned Resources]
-        
-        G[Resource Groups] --> H[Development]
-        G --> I[Production]
-        G --> J[Administration]
-        
-        H --> K[User Inherits<br/>Group Permissions]
-        I --> K
-        J --> K
-    end
+graph TD
+    A[IAM User Created] --> B[EventBridge Event]
+    B --> C[Lambda Function Triggered]
+    C --> D[Add User to MFA Group]
+    D --> E[EnforceMFA Policy Applied]
+    E --> F{User Authentication}
+    F -->|Without MFA| G[❌ Access DENIED to ALL Resources]
+    F -->|With MFA| H[✅ Access GRANTED to Resources]
     
-    subgraph "Policy Logic"
-        L[IAM Policy] --> M[Condition Check:<br/>aws:MultiFactorAuthPresent]
-        M -->|True| N[Allow Access]
-        M -->|False| O[Deny Access]
-    end
+    style G fill:#ffebee,color:#c62828
+    style H fill:#e8f5e9,color:#2e7d32
 ```
 
-## 📁 IAM Components
+## 🚨 **IMPORTANT WARNING**
+Users added to the MFA group **WILL NOT** be able to:
+- Access EC2 instances (even with proper IAM permissions)
+- Use S3 buckets they own
+- Access RDS databases they created
+- Use ANY AWS service through console or CLI
+- Perform ANY AWS API calls
 
-### 1. **All-Staff Group**
-- **Name**: `All-Staff`
-- **Purpose**: Default group for all employees
-- **Policy**: Enforces MFA setup before resource access
+**UNLESS they have configured and authenticated with MFA.**
 
-### 2. **Resource Groups**
-- **Development**: `Dev-Team` - Access to development resources
-- **Production**: `Prod-Team` - Access to production resources  
-- **Administration**: `Admin-Team` - Administrative privileges
-- **Finance**: `Finance-Team` - Financial system access
+## Components
 
-## 🔐 IAM Policies
+### 1. IAM Policy: `EnforceMFA`
+This policy **DENIES ALL ACCESS** to AWS resources unless MFA is authenticated.
 
-### MFA Enforcement Policy (Attached to All-Staff Group)
+**Complete Policy:**
 ```json
 {
     "Version": "2012-10-17",
     "Statement": [
         {
-            "Sid": "BlockMostAccessUnlessSignedInWithMFA",
+            "Sid": "AllowViewAccountInfo",
+            "Effect": "Allow",
+            "Action": [
+                "iam:GetAccountPasswordPolicy",
+                "iam:ListVirtualMFADevices"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowManageOwnPasswords",
+            "Effect": "Allow",
+            "Action": [
+                "iam:ChangePassword",
+                "iam:GetUser"
+            ],
+            "Resource": "arn:aws:iam::*:user/${aws:username}"
+        },
+        {
+            "Sid": "AllowManageOwnMFA",
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateVirtualMFADevice",
+                "iam:DeleteVirtualMFADevice",
+                "iam:EnableMFADevice",
+                "iam:ResyncMFADevice",
+                "iam:ListMFADevices"
+            ],
+            "Resource": [
+                "arn:aws:iam::*:user/${aws:username}",
+                "arn:aws:iam::*:mfa/${aws:username}"
+            ]
+        },
+        {
+            "Sid": "DenyAllExceptListedIfNoMFA",
             "Effect": "Deny",
             "NotAction": [
                 "iam:CreateVirtualMFADevice",
                 "iam:EnableMFADevice",
+                "iam:GetUser",
                 "iam:ListMFADevices",
-                "iam:ListUsers",
                 "iam:ListVirtualMFADevices",
                 "iam:ResyncMFADevice",
-                "sts:GetSessionToken"
+                "iam:ChangePassword",
+                "iam:GetAccountPasswordPolicy"
             ],
             "Resource": "*",
             "Condition": {
@@ -79,172 +99,260 @@ graph TB
 }
 ```
 
-### Example Resource Group Policy
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "AllowS3BucketAccessWithMFA",
-            "Effect": "Allow",
-            "Action": [
-                "s3:ListBucket",
-                "s3:GetObject",
-                "s3:PutObject"
-            ],
-            "Resource": [
-                "arn:aws:s3:::your-bucket-name",
-                "arn:aws:s3:::your-bucket-name/*"
-            ],
-            "Condition": {
-                "Bool": {
-                    "aws:MultiFactorAuthPresent": "true"
-                }
-            }
-        }
-    ]
-}
+### 2. IAM Group: `MFA`
+- Contains all users who require MFA
+- Has the **restrictive** `EnforceMFA` policy attached
+- Membership is **mandatory** for accessing any resources
+
+### 3. Automation Pipeline
+```
+IAM CreateUser Event → EventBridge → Lambda → Add to MFA Group → EnforceMFA Policy Active
 ```
 
-## 🚀 Implementation Steps
+## Implementation Steps
 
-### 1. **Initial Setup**
+### Step 1: Create the MFA Group and Policy
 ```bash
-# Create All-Staff group
-aws iam create-group --group-name All-Staff
+# Create the MFA group
+aws iam create-group --group-name MFA
 
-# Attach MFA enforcement policy
-aws iam put-group-policy \
-    --group-name All-Staff \
-    --policy-name MFASetupEnforcement \
-    --policy-document file://mfa-enforcement-policy.json
-```
+# Create the restrictive MFA policy
+aws iam create-policy \
+  --policy-name EnforceMFA \
+  --policy-document file://enforce-mfa-policy.json \
+  --description "Enforces MFA for all access - DENIES ALL without MFA"
 
-### 2. **User Creation Process**
-```bash
-# Create new user
-aws iam create-user --user-name john.doe
-
-# Add user to All-Staff group
-aws iam add-user-to-group \
-    --user-name john.doe \
-    --group-name All-Staff
-
-# Create login profile (if console access needed)
-aws iam create-login-profile \
-    --user-name john.doe \
-    --password-initial-reset \
-    --password 'temporary-password'
-```
-
-### 3. **Group Management**
-```bash
-# Create resource-specific groups
-aws iam create-group --group-name Dev-Team
-aws iam create-group --group-name Prod-Team
-
-# Assign resource policies to groups
+# Attach the policy to the group
 aws iam attach-group-policy \
-    --group-name Dev-Team \
-    --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
-
-# Add users to resource groups
-aws iam add-user-to-group \
-    --user-name john.doe \
-    --group-name Dev-Team
+  --group-name MFA \
+  --policy-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):policy/EnforceMFA
 ```
 
-## 🔄 User Flow
+### Step 2: Deploy the Lambda Function
+```python
+import json
+import boto3
+from botocore.exceptions import ClientError
 
-### New User Journey
-1. **Account Creation**: User is created and added to `All-Staff` group
-2. **Initial Login**: User can only:
-   - Change password
-   - Set up MFA device
-   - View own user information
-3. **MFA Setup**: User configures virtual/ hardware MFA device
-4. **Access Granted**: After MFA setup, user inherits permissions from assigned resource groups
-5. **Resource Access**: User can access resources based on group memberships
+iam_client = boto3.client('iam')
 
-### MFA Enforcement Logic
-```mermaid
-flowchart TD
-    Start[User Attempts API Call] --> Check{Is MFA Present?}
-    Check -->|No| Deny[Access Denied<br/>Except MFA Setup Actions]
-    Check -->|Yes| Allow[Access Granted<br/>Based on Group Policies]
-    Deny --> MFA[User Must Setup MFA]
-    MFA -->|Complete| Start
+def lambda_handler(event, context):
+    """
+    Adds newly created IAM users to the MFA enforcement group
+    """
+    try:
+        # Extract user information from EventBridge event
+        user_name = event['detail']['requestParameters']['userName']
+        
+        print(f"Adding new user '{user_name}' to MFA group...")
+        
+        # Add user to MFA group
+        iam_client.add_user_to_group(
+            GroupName='MFA',
+            UserName=user_name
+        )
+        
+        # Send notification (optional)
+        send_notification(user_name)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': f'Successfully added {user_name} to MFA group',
+                'warning': 'User cannot access ANY resources without MFA setup'
+            })
+        }
+        
+    except ClientError as e:
+        print(f"Error adding user to MFA group: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+def send_notification(user_name):
+    """Send notification about MFA requirement"""
+    # Implement SNS or email notification here
+    print(f"ALERT: User {user_name} added to MFA group. They must setup MFA to access resources.")
 ```
 
-## 📊 Monitoring & Compliance
-
-### CloudWatch Metrics to Monitor
-- `MFADevicesCreated`
-- `ConsoleSignInWithoutMFA`
-- `AccessDeniedDueToMFAMissing`
-
-### AWS Config Rules
+### Step 3: Configure EventBridge Rule
+**Event Pattern:**
 ```json
 {
-    "ConfigRule": {
-        "ConfigRuleName": "mfa-enabled-for-iam-console-access",
-        "Description": "Checks whether AWS Multi-Factor Authentication (MFA) is enabled for all IAM users that use a console password.",
-        "Scope": {
-            "ComplianceResourceTypes": ["AWS::IAM::User"]
-        },
-        "Source": {
-            "Owner": "AWS",
-            "SourceIdentifier": "MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"
-        }
-    }
+  "source": ["aws.iam"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventSource": ["iam.amazonaws.com"],
+    "eventName": ["CreateUser"]
+  }
 }
 ```
 
-## 🛠️ Troubleshooting
+**Lambda Permission:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:AddUserToGroup",
+        "iam:GetGroup"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:group/MFA",
+        "arn:aws:iam::*:user/*"
+      ]
+    }
+  ]
+}
+```
 
-### Common Issues & Solutions
+## 🆘 User Onboarding Instructions
 
-1. **User cannot access any resources**
-   - ✅ Check if MFA is configured in user's security credentials
-   - ✅ Verify user is in correct resource groups
-   - ✅ Confirm MFA device is active and synced
+### For New Users: MFA Setup REQUIRED
+1. **First Login Attempt** will fail for all resources
+2. **Users MUST:**
+   ```bash
+   # 1. Login to AWS Console (will see access denied)
+   # 2. Navigate to IAM → Security Credentials
+   # 3. Configure MFA device
+   # 4. Logout and login with MFA token
+   # 5. NOW access is granted to resources
+   ```
 
-2. **User cannot set up MFA**
-   - ✅ Ensure user has `iam:CreateVirtualMFADevice` permission
-   - ✅ Check user is in `All-Staff` group
-   - ✅ Verify no conflicting deny policies
+### MFA Setup via AWS CLI (Alternative)
+```bash
+# User creates virtual MFA device
+aws iam create-virtual-mfa-device \
+  --virtual-mfa-device-name MyMFADevice \
+  --outfile ./qr-code.png \
+  --bootstrap-method QRCodePNG
 
-3. **Group permissions not applying**
-   - ✅ Confirm user is added to resource groups
-   - ✅ Check group policies are attached correctly
-   - ✅ Validate policy conditions allow MFA-authenticated requests
+# User enables the MFA device
+aws iam enable-mfa-device \
+  --user-name ${USERNAME} \
+  --serial-number arn:aws:iam::${ACCOUNT_ID}:mfa/${USERNAME} \
+  --authentication-code-1 123456 \
+  --authentication-code-2 789012
+```
 
-## 📝 Best Practices
+## Testing and Validation
 
-1. **Regular Audits**
-   - Monthly review of IAM users without MFA
-   - Quarterly group membership review
-   - Bi-annual policy review
+### Test User Creation
+```bash
+# Create test user
+aws iam create-user --user-name test-mfa-user
 
-2. **Emergency Access**
-   - Maintain break-glass accounts outside MFA enforcement
-   - Store credentials in secure, monitored location
-   - Regular testing of emergency procedures
+# Verify group membership
+aws iam get-group --group-name MFA
 
-3. **User Offboarding**
-   - Immediate removal from all groups
-   - Disable console access
-   - Deactivate access keys
-   - Remove MFA devices
+# Test access (should fail without MFA)
+aws iam list-users --profile test-mfa-user
+# AccessDenied: MultiFactorAuthentication failed with invalid MFA
+```
 
-## 🔗 Related Documentation
+### Validation Checklist
+- [ ] New user automatically added to MFA group
+- [ ] EnforceMFA policy attached and active
+- [ ] User cannot access ANY resources without MFA
+- [ ] User CAN configure MFA device
+- [ ] User CAN access resources AFTER MFA setup
+- [ ] Lambda logs show successful execution
+- [ ] EventBridge events are triggering correctly
 
-- [AWS IAM Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html)
-- [MFA-Protected API Access](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html)
-- [IAM Policy Conditions](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition.html)
+## Troubleshooting Guide
 
+### Issue: User cannot access ANYTHING
+**Solution:** This is expected behavior. User MUST:
+1. Configure MFA device in IAM console
+2. Authenticate with MFA token
+3. Access will be granted immediately after MFA auth
 
+### Issue: Lambda not adding users to group
+**Check:**
+```bash
+# 1. Check CloudWatch logs
+aws logs tail /aws/lambda/MFA-Enforcement-Lambda
+
+# 2. Verify EventBridge rule
+aws events list-rules --name-pattern "*iam*create*"
+
+# 3. Check Lambda permissions
+aws iam get-role-policy --role-name MFA-Lambda-Role --policy-name LambdaExecutionPolicy
+```
+
+### Issue: Policy not enforcing
+**Verify:**
+```bash
+# Check group policies
+aws iam list-attached-group-policies --group-name MFA
+
+# Simulate policy with policy simulator
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::ACCOUNT_ID:group/MFA \
+  --action-names "s3:ListBuckets" \
+  --context-entries "ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=false,ContextKeyType=boolean"
+```
+
+## Rollback Procedure
+
+### Emergency Disable
+1. **Disable EventBridge Rule:**
+   ```bash
+   aws events disable-rule --name "IAM-User-Created-MFA"
+   ```
+
+2. **Remove User from MFA Group:**
+   ```bash
+   aws iam remove-user-from-group --group-name MFA --user-name TROUBLED_USER
+   ```
+
+3. **Detach Policy (Last Resort):**
+   ```bash
+   aws iam detach-group-policy --group-name MFA --policy-arn arn:aws:iam::ACCOUNT:policy/EnforceMFA
+   ```
+
+## Monitoring and Alerts
+
+### CloudWatch Alarms
+```bash
+# Lambda failures
+aws cloudwatch put-metric-alarm \
+  --alarm-name "MFA-Lambda-Failures" \
+  --metric-name Errors \
+  --namespace AWS/Lambda \
+  --statistic Sum \
+  --period 300 \
+  --threshold 1 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:region:account:Security-Alerts
+```
+
+### Daily Reports
+```bash
+# Users without MFA in MFA group (should be 0)
+aws iam get-group --group-name MFA
+```
+
+## Support and Escalation
+
+**Level 1:** Cloud Team - Check Lambda/EventBridge logs  
+**Level 2:** Security Team - Policy and access issues  
+**Level 3:** AWS Support - IAM service issues  
+
+**Emergency Contact:** Security Operations Center (SOC): soc@company.com
 
 ---
 
-**Note**: Always test in a non-production environment first and ensure break-glass procedures are established before enforcing MFA requirements.
+## 📋 Key Takeaways
+1. **MFA is MANDATORY** - No exceptions for resource access
+2. **Automatic enrollment** - All new users get MFA requirement
+3. **Zero resource access** without MFA - This is by design
+4. **User responsibility** - Users MUST setup MFA immediately after creation
+5. **No backdoors** - Policy strictly enforces MFA for all operations
+
+**Last Updated:** 1/23/26
+**Version:** 2.0  
+**Author:** Robert
