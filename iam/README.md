@@ -40,62 +40,113 @@ This policy **DENIES ALL ACCESS** to AWS resources unless MFA is authenticated.
 **Complete Policy:**
 ```json
 {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "AllowViewAccountInfo",
-            "Effect": "Allow",
-            "Action": [
-                "iam:GetAccountPasswordPolicy",
-                "iam:ListVirtualMFADevices"
-            ],
-            "Resource": "*"
-        },
-        {
-            "Sid": "AllowManageOwnPasswords",
-            "Effect": "Allow",
-            "Action": [
-                "iam:ChangePassword",
-                "iam:GetUser"
-            ],
-            "Resource": "arn:aws:iam::*:user/${aws:username}"
-        },
-        {
-            "Sid": "AllowManageOwnMFA",
-            "Effect": "Allow",
-            "Action": [
-                "iam:CreateVirtualMFADevice",
-                "iam:DeleteVirtualMFADevice",
-                "iam:EnableMFADevice",
-                "iam:ResyncMFADevice",
-                "iam:ListMFADevices"
-            ],
-            "Resource": [
-                "arn:aws:iam::*:user/${aws:username}",
-                "arn:aws:iam::*:mfa/${aws:username}"
-            ]
-        },
-        {
-            "Sid": "DenyAllExceptListedIfNoMFA",
-            "Effect": "Deny",
-            "NotAction": [
-                "iam:CreateVirtualMFADevice",
-                "iam:EnableMFADevice",
-                "iam:GetUser",
-                "iam:ListMFADevices",
-                "iam:ListVirtualMFADevices",
-                "iam:ResyncMFADevice",
-                "iam:ChangePassword",
-                "iam:GetAccountPasswordPolicy"
-            ],
-            "Resource": "*",
-            "Condition": {
-                "BoolIfExists": {
-                    "aws:MultiFactorAuthPresent": "false"
-                }
-            }
-        }
-    ]
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "AllowViewAccountInfo",
+			"Effect": "Allow",
+			"Action": [
+				"iam:GetAccountPasswordPolicy",
+				"iam:ListVirtualMFADevices"
+			],
+			"Resource": "*"
+		},
+		{
+			"Sid": "AllowManageOwnPasswords",
+			"Effect": "Allow",
+			"Action": [
+				"iam:ChangePassword",
+				"iam:GetUser"
+			],
+			"Resource": "arn:aws:iam::*:user/${aws:username}"
+		},
+		{
+			"Sid": "AllowManageOwnAccessKeys",
+			"Effect": "Allow",
+			"Action": [
+				"iam:CreateAccessKey",
+				"iam:DeleteAccessKey",
+				"iam:ListAccessKeys",
+				"iam:UpdateAccessKey",
+				"iam:GetAccessKeyLastUsed"
+			],
+			"Resource": "arn:aws:iam::*:user/${aws:username}"
+		},
+		{
+			"Sid": "AllowManageOwnSigningCertificates",
+			"Effect": "Allow",
+			"Action": [
+				"iam:DeleteSigningCertificate",
+				"iam:ListSigningCertificates",
+				"iam:UpdateSigningCertificate",
+				"iam:UploadSigningCertificate"
+			],
+			"Resource": "arn:aws:iam::*:user/${aws:username}"
+		},
+		{
+			"Sid": "AllowManageOwnSSHPublicKeys",
+			"Effect": "Allow",
+			"Action": [
+				"iam:DeleteSSHPublicKey",
+				"iam:GetSSHPublicKey",
+				"iam:ListSSHPublicKeys",
+				"iam:UpdateSSHPublicKey",
+				"iam:UploadSSHPublicKey"
+			],
+			"Resource": "arn:aws:iam::*:user/${aws:username}"
+		},
+		{
+			"Sid": "AllowManageOwnGitCredentials",
+			"Effect": "Allow",
+			"Action": [
+				"iam:CreateServiceSpecificCredential",
+				"iam:DeleteServiceSpecificCredential",
+				"iam:ListServiceSpecificCredentials",
+				"iam:ResetServiceSpecificCredential",
+				"iam:UpdateServiceSpecificCredential"
+			],
+			"Resource": "arn:aws:iam::*:user/${aws:username}"
+		},
+		{
+			"Sid": "AllowManageOwnVirtualMFADevice",
+			"Effect": "Allow",
+			"Action": [
+				"iam:CreateVirtualMFADevice"
+			],
+			"Resource": "arn:aws:iam::*:mfa/*"
+		},
+		{
+			"Sid": "AllowManageOwnUserMFA",
+			"Effect": "Allow",
+			"Action": [
+				"iam:DeactivateMFADevice",
+				"iam:EnableMFADevice",
+				"iam:ListMFADevices",
+				"iam:ResyncMFADevice"
+			],
+			"Resource": "arn:aws:iam::*:user/${aws:username}"
+		},
+		{
+			"Sid": "DenyAllExceptListedIfNoMFA",
+			"Effect": "Deny",
+			"NotAction": [
+				"iam:CreateVirtualMFADevice",
+				"iam:EnableMFADevice",
+				"iam:GetUser",
+				"iam:GetMFADevice",
+				"iam:ListMFADevices",
+				"iam:ListVirtualMFADevices",
+				"iam:ResyncMFADevice",
+				"sts:GetSessionToken"
+			],
+			"Resource": "*",
+			"Condition": {
+				"BoolIfExists": {
+					"aws:MultiFactorAuthPresent": "false"
+				}
+			}
+		}
+	]
 }
 ```
 
@@ -130,50 +181,37 @@ aws iam attach-group-policy \
 
 ### Step 2: Deploy the Lambda Function
 ```python
-import json
 import boto3
-from botocore.exceptions import ClientError
+import json
 
-iam_client = boto3.client('iam')
+iam = boto3.client('iam')
 
 def lambda_handler(event, context):
-    """
-    Adds newly created IAM users to the MFA enforcement group
-    """
+    # Define your target group name
+    TARGET_GROUP = 'MFA'  # Change this to your group name
+    
     try:
-        # Extract user information from EventBridge event
-        user_name = event['detail']['requestParameters']['userName']
+        # Extract username from the event
+        username = event['detail']['requestParameters']['userName']
         
-        print(f"Adding new user '{user_name}' to MFA group...")
+        print(f"New user detected: {username}")
         
-        # Add user to MFA group
-        iam_client.add_user_to_group(
-            GroupName='MFA',
-            UserName=user_name
+        # Add user to the group
+        response = iam.add_user_to_group(
+            GroupName=TARGET_GROUP,
+            UserName=username
         )
         
-        # Send notification (optional)
-        send_notification(user_name)
+        print(f"Successfully added {username} to {TARGET_GROUP}")
         
         return {
             'statusCode': 200,
-            'body': json.dumps({
-                'message': f'Successfully added {user_name} to MFA group',
-                'warning': 'User cannot access ANY resources without MFA setup'
-            })
+            'body': json.dumps(f'User {username} added to {TARGET_GROUP}')
         }
         
-    except ClientError as e:
-        print(f"Error adding user to MFA group: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
-        }
-
-def send_notification(user_name):
-    """Send notification about MFA requirement"""
-    # Implement SNS or email notification here
-    print(f"ALERT: User {user_name} added to MFA group. They must setup MFA to access resources.")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise e
 ```
 
 ### Step 3: Configure EventBridge Rule
@@ -192,20 +230,17 @@ def send_notification(user_name):
 **Lambda Permission:**
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "iam:AddUserToGroup",
-        "iam:GetGroup"
-      ],
-      "Resource": [
-        "arn:aws:iam::*:group/MFA",
-        "arn:aws:iam::*:user/*"
-      ]
-    }
-  ]
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Effect": "Allow",
+			"Action": [
+				"iam:AddUserToGroup",
+				"iam:GetUser"
+			],
+			"Resource": "*"
+		}
+	]
 }
 ```
 
